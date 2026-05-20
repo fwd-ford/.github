@@ -1,0 +1,35 @@
+name: ✅ Task
+description: Trabalho técnico, ajuste, refactor ou tarefa rotineira
+title: "[TASK] "
+labels: ["task"]
+body:
+  - type: textarea
+    id: context
+    attributes:
+      label: Contexto
+      description: Por que essa task existe?
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: Escopo / Tarefa
+      description: O que precisa ser feito? Quebre em sub-passos se ajudar.
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Critérios de aceite
+      placeholder: |
+        - [ ] critério 1
+        - [ ] critério 2
+    validations:
+      required: true
+  - type: textarea
+    id: refs
+    attributes:
+      label: Referências
+      description: Links, docs, issues relacionadas
+    validations:
+      required: false
