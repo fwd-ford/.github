@@ -1,0 +1,43 @@
+name: 🐛 Bug
+description: Algo não funciona como deveria
+title: "[BUG] "
+labels: ["bug"]
+body:
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: O que aconteceu?
+      description: Descreva o comportamento observado
+      placeholder: "Quando fui acessar X, vi Y, mas esperava Z."
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Passos pra reproduzir
+      placeholder: |
+        1. Vá em ...
+        2. Clique em ...
+        3. Veja o erro ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Comportamento esperado
+    validations:
+      required: true
+  - type: input
+    id: env
+    attributes:
+      label: Ambiente
+      description: SO, versão do Node/Java/Python, browser, etc.
+    validations:
+      required: false
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs ou screenshots
+      render: shell
+    validations:
+      required: false
