@@ -40,8 +40,7 @@ ForwardService cruza eventos do dataset oficial Ford VIN Share com modelos de ch
 | [forward-ml](https://github.com/fwd-ford/forward-ml) | Python + scikit-learn + XGBoost | Lucca |
 | [forward-mobile](https://github.com/fwd-ford/forward-mobile) | React Native + Expo + TypeScript | Jota |
 | [forward-infra](https://github.com/fwd-ford/forward-infra) | Supabase + Postgres + Docker | Jota |
-| [forward-docs](https://github.com/fwd-ford/forward-docs) | Documentação técnica + acadêmica | Todos |
-| [forward-sprints](https://github.com/fwd-ford/forward-sprints) | Entregáveis de sprint | Todos |
+| [forward-docs](https://github.com/fwd-ford/forward-docs) | Documentação técnica + acadêmica + entregáveis de sprint | Todos |
 | [forward-web](https://github.com/fwd-ford/forward-web) | SvelteKit (reservado p/ Sprint 3+) | — |
 
 ## Sprint atual
