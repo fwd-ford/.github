@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 📋 Project board (Sprint 1)
+    url: https://github.com/orgs/fwd-ford/projects/1
+    about: Veja o quadro kanban da sprint atual antes de abrir uma issue.
+  - name: 📚 Documentação do projeto
+    url: https://github.com/fwd-ford/forward-docs
+    about: Antes de reportar, confira a base fundacional, solution design e jornada do projeto.
