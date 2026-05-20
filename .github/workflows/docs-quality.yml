@@ -1,0 +1,30 @@
+name: Docs Quality (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      docs-paths:
+        type: string
+        default: "**/*.md"
+        description: "Glob of markdown files to lint"
+
+jobs:
+  markdownlint:
+    name: Markdown lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DavidAnson/markdownlint-cli2-action@v17
+        with:
+          globs: ${{ inputs.docs-paths }}
+
+  link-check:
+    name: Broken link check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: lycheeverse/lychee-action@v2
+        with:
+          args: --no-progress --max-concurrency 4 --exclude-mail --accept 200,206,429 './**/*.md'
+          fail: true
+          token: ${{ secrets.GITHUB_TOKEN }}
