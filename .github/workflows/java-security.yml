@@ -41,25 +41,6 @@ jobs:
           path: target/dependency-check-report.html
           retention-days: 14
 
-  codeql:
-    name: CodeQL SAST
-    runs-on: ubuntu-latest
-    permissions:
-      security-events: write
-      actions: read
-      contents: read
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: ${{ inputs.java-version }}
-          cache: maven
-      - uses: github/codeql-action/init@v3
-        with:
-          languages: java
-          queries: security-and-quality
-      - run: ./mvnw -B -DskipTests package
-      - uses: github/codeql-action/analyze@v3
-        with:
-          category: "/language:java"
+  # CodeQL removed - GitHub Advanced Security is required for code scanning on
+  # private repositories and is a paid add-on. SpotBugs + FindSecBugs (in the
+  # quality profile) provides equivalent static security analysis for free.
