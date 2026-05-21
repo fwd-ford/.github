@@ -23,8 +23,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Compute lychee args
+        id: lychee-args
+        run: |
+          if [ -f lychee.toml ]; then
+            echo "args=--no-progress --config lychee.toml './**/*.md'" >> $GITHUB_OUTPUT
+          else
+            echo "args=--no-progress --max-concurrency 4 --accept 200,206,403,429 './**/*.md'" >> $GITHUB_OUTPUT
+          fi
+
       - uses: lycheeverse/lychee-action@v2
         with:
-          args: --no-progress --max-concurrency 4 --accept 200,206,429 './**/*.md'
+          args: ${{ steps.lychee-args.outputs.args }}
           fail: true
           token: ${{ secrets.GITHUB_TOKEN }}
