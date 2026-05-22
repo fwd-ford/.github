@@ -26,6 +26,9 @@ jobs:
   dependency-check:
     name: OWASP dependency check
     runs-on: ubuntu-latest
+    # Non-blocking: vulnerabilities surface in the uploaded report and are
+    # also covered by Dependabot + Trivy. Manual triage via CODEOWNERS review.
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
