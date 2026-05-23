@@ -23,28 +23,7 @@ jobs:
           trivyignores: ./.trivyignore
           format: table
 
-  dependency-check:
-    name: OWASP dependency check
-    runs-on: ubuntu-latest
-    # Non-blocking: vulnerabilities surface in the uploaded report and are
-    # also covered by Dependabot + Trivy. Manual triage via CODEOWNERS review.
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: ${{ inputs.java-version }}
-          cache: maven
-      - run: ./mvnw -B -DskipTests verify -P security
-      - name: Upload report
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: dependency-check-report
-          path: target/dependency-check-report.html
-          retention-days: 14
-
-  # CodeQL removed - GitHub Advanced Security is required for code scanning on
-  # private repositories and is a paid add-on. SpotBugs + FindSecBugs (in the
-  # quality profile) provides equivalent static security analysis for free.
+  # OWASP dependency-check removed: was non-blocking and overlapped with
+  # Trivy filesystem scan + Dependabot, which cover CVE surface in deps.
+  # CodeQL not wired: GitHub Advanced Security is paid on private orgs.
+  # SpotBugs + FindSecBugs (java-quality) provide free static analysis.

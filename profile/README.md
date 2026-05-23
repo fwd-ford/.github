@@ -64,7 +64,7 @@ Disciplinas avaliativas: SOA · Mobile · Testing/QA · Cybersecurity · IA/ML
 Este repositório (`.github`) hospeda os **workflows reutilizáveis** chamados pelos demais repos da organização.
 
 - `java-quality.yml` — Spotless + Checkstyle + SpotBugs + JUnit
-- `java-security.yml` — Trivy + OWASP Dependency Check + CodeQL SAST
+- `java-security.yml` — Trivy filesystem scan (CVEs em deps via Trivy + Dependabot)
 - `secrets-scan.yml` — Gitleaks (escaneamento de credenciais)
 - `docs-quality.yml` — markdownlint + verificação de links quebrados
 
