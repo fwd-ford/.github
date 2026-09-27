@@ -64,6 +64,10 @@ on:
         description: "requirements.txt to resolve and audit with pip-audit (empty skips)."
         type: string
         default: ""
+      java-version:
+        description: "JDK used to pre-resolve Maven dependencies before Trivy (Maven projects only)."
+        type: string
+        default: "17"
       scan-history:
         description: "Scan the whole git history for secrets (true) or only the working tree (false)."
         type: boolean
@@ -240,6 +244,24 @@ jobs:
           echo "${TRIVY_SHA256}  trivy.tgz" | sha256sum -c -
           tar -xzf trivy.tgz trivy && sudo mv trivy /usr/local/bin/ && rm trivy.tgz
           trivy --version
+
+      - name: Set up Java (Maven projects only)
+        if: ${{ hashFiles('**/pom.xml') != '' }}
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5.7.0
+        with:
+          distribution: temurin
+          java-version: ${{ inputs.java-version }}
+          cache: maven
+
+      - name: Pre-resolve Maven dependencies into ~/.m2
+        # Trivy reads POMs from the local repository first. Resolving with Maven
+        # (cached between runs) avoids the Maven Central HTTP 429 responses that
+        # GitHub-hosted runners get when Trivy fetches every BOM remotely.
+        if: ${{ hashFiles('**/pom.xml') != '' }}
+        continue-on-error: true
+        run: |
+          if [ -f mvnw ]; then chmod +x mvnw && MVN=./mvnw; else MVN=mvn; fi
+          $MVN -B -q -DskipTests dependency:resolve
 
       - name: Trivy fs (vulnerable dependencies)
         id: scan
@@ -587,14 +609,63 @@ jobs:
           tar -xzf trivy.tgz trivy && sudo mv trivy /usr/local/bin/ && rm trivy.tgz
           trivy --version
 
+      - name: Set up Java (Maven projects only)
+        if: ${{ hashFiles('**/pom.xml') != '' }}
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5.7.0
+        with:
+          distribution: temurin
+          java-version: ${{ inputs.java-version }}
+          cache: maven
+
+      - name: Pre-resolve Maven dependencies into ~/.m2
+        # Trivy reads POMs from the local repository first. Resolving with Maven
+        # (cached between runs) avoids the Maven Central HTTP 429 responses that
+        # GitHub-hosted runners get when Trivy fetches every BOM remotely.
+        if: ${{ hashFiles('**/pom.xml') != '' }}
+        continue-on-error: true
+        run: |
+          if [ -f mvnw ]; then chmod +x mvnw && MVN=./mvnw; else MVN=mvn; fi
+          $MVN -B -q -DskipTests dependency:resolve
+
+      - name: Set up Python (resolve requirements for the SBOM)
+        if: ${{ inputs.python-requirements != '' }}
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+
+      - name: Resolve Python requirements (pinned set)
+        # requirements.txt with >= ranges is invisible to lockfile-based SBOM
+        # tools; the resolved set documents what an install gets today.
+        if: ${{ inputs.python-requirements != '' }}
+        continue-on-error: true
+        env:
+          REQS: ${{ inputs.python-requirements }}
+        run: |
+          python -m pip install --disable-pip-version-check --quiet --dry-run \
+            --ignore-installed --report /tmp/resolve.json -r "$REQS"
+          mkdir -p /tmp/pyresolved
+          python - <<'PY'
+          import json
+          report = json.load(open("/tmp/resolve.json"))
+          with open("/tmp/pyresolved/requirements.txt", "w") as fh:
+              for item in report.get("install", []):
+                  meta = item["metadata"]
+                  fh.write(f"{meta['name']}=={meta['version']}\n")
+          PY
+          wc -l /tmp/pyresolved/requirements.txt
+
       - name: Generate CycloneDX SBOM
         id: scan
         continue-on-error: true
         run: |
           mkdir -p "$OUT_DIR"
           trivy fs --format cyclonedx --output "$OUT_DIR/sbom-source.cdx.json" .
-          python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print('components:', len(d.get('components', [])))" \
-            "$OUT_DIR/sbom-source.cdx.json"
+          if [ -f /tmp/pyresolved/requirements.txt ]; then
+            trivy fs --format cyclonedx --output "$OUT_DIR/sbom-python-resolved.cdx.json" /tmp/pyresolved
+          fi
+          for f in "$OUT_DIR"/sbom-*.cdx.json; do
+            python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(sys.argv[1], len(d.get('components', [])))" "$f"
+          done
 
       - name: Record status
         if: always()
@@ -736,12 +807,22 @@ jobs:
               except ValueError:
                   changes = []
               n = sum(len(c.get("vulnerabilities", [])) for c in changes)
-              extra.append(("SCA", "Dependency Review (PR)", status("dependency-review"), f"{n} vulnerabilidades introduzidas pelo PR"))
-          for sbom in sorted(glob.glob("results/sbom-*.cdx.json")):
+              st = status("dependency-review")
+              text = (f"{n} vulnerabilidades introduzidas pelo PR" if st == "ok" else
+                      "nao concluiu (ver log do job; exige Dependency graph habilitado no repositorio)")
+              extra.append(("SCA", "Dependency Review (PR)", st, text))
+          sboms = sorted(glob.glob("results/sbom-*.cdx.json"))
+          for sbom in sboms:
               comps = len(json.load(open(sbom)).get("components", []))
-              kind = "imagem" if "image" in sbom else "codigo-fonte"
-              st = status("sbom") if kind == "codigo-fonte" else status("trivy-image")
+              if "image" in sbom:
+                  kind, st = "imagem", status("trivy-image")
+              elif "python" in sbom:
+                  kind, st = "Python resolvido", status("sbom")
+              else:
+                  kind, st = "codigo-fonte", status("sbom")
               extra.append(("SBOM", f"CycloneDX ({kind})", st, f"{comps} componentes inventariados"))
+          if status("sbom") and not any("source" in s for s in sboms):
+              extra.append(("SBOM", "CycloneDX (codigo-fonte)", status("sbom"), "arquivo nao gerado"))
 
           env = os.environ
           lines = [
