@@ -1,0 +1,794 @@
+name: DevSecOps (reusable)
+
+# Report-only security pipeline shared by every fwd-ford repository.
+#
+# Stages (each one is an independent, non-blocking job):
+#   1. SAST       Semgrep CE (official container) + CodeQL (matrix per language)
+#   2. SCA        dependency-review (PRs only) + Trivy fs (lockfiles/manifests)
+#                 + pip-audit for Python requirements (resolved before audit)
+#   3. Secrets    Gitleaks over the full git history
+#   4. IaC        Trivy config (Dockerfile/K8s/Terraform) + Fly.io policy check
+#   5. Container  build the Dockerfile locally and scan the image with Trivy
+#   6. SBOM       CycloneDX (source tree, plus the image when it is built)
+#   7. Summary    findings per tool and severity in $GITHUB_STEP_SUMMARY
+#
+# Every finding is uploaded as SARIF to GitHub code scanning (Security tab).
+# Nothing here fails the caller: scan steps use continue-on-error and every
+# job is continue-on-error, so the pipeline never blocks a pull request.
+# Tools are pinned: actions by commit SHA, binaries by version + SHA-256,
+# the Semgrep container by digest (see the trivy-action tag hijack of
+# March 2026 for why mutable refs such as @master are avoided here).
+#
+# Caller example (permissions must be granted by the caller):
+#
+#   permissions:
+#     contents: read
+#     security-events: write
+#     pull-requests: read
+#   jobs:
+#     devsecops:
+#       uses: fwd-ford/.github/.github/workflows/devsecops.yml@main
+#       with:
+#         codeql-languages: '["java-kotlin","actions"]'
+#         dockerfile: Dockerfile
+#         run-container-scan: true
+
+on:
+  workflow_call:
+    inputs:
+      codeql-languages:
+        description: 'JSON array of CodeQL languages, e.g. ["java-kotlin","actions"]. Use "[]" to skip CodeQL.'
+        type: string
+        default: '["actions"]'
+      semgrep-config:
+        description: "Space-separated Semgrep registry rulesets or rule files."
+        type: string
+        default: "p/default"
+      dockerfile:
+        description: "Path of the Dockerfile to build and scan (empty skips the container stage)."
+        type: string
+        default: ""
+      docker-context:
+        description: "Docker build context used with the dockerfile input."
+        type: string
+        default: "."
+      run-container-scan:
+        description: "Build the dockerfile and scan the resulting image with Trivy."
+        type: boolean
+        default: false
+      run-iac-scan:
+        description: "Run Trivy config and the Fly.io policy check."
+        type: boolean
+        default: true
+      python-requirements:
+        description: "requirements.txt to resolve and audit with pip-audit (empty skips)."
+        type: string
+        default: ""
+      scan-history:
+        description: "Scan the whole git history for secrets (true) or only the working tree (false)."
+        type: boolean
+        default: true
+      severity:
+        description: "Severities exported to code scanning (SARIF). The summary table counts every severity."
+        type: string
+        default: "CRITICAL,HIGH,MEDIUM"
+
+permissions:
+  contents: read
+  security-events: write
+  pull-requests: read
+
+env:
+  TRIVY_VERSION: "0.74.0"
+  TRIVY_SHA256: "2ae6fe3ee734b7fdf11335663e18c75ea12dccc76062f09f164a3b0f8be4371a"
+  GITLEAKS_VERSION: "8.30.1"
+  GITLEAKS_SHA256: "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
+  SEMGREP_IMAGE: "semgrep/semgrep:1.178.0@sha256:32e459968daabe7ab86968184a29109b9564aa00392401156f9788452b42786b"
+  PIP_AUDIT_VERSION: "2.9.0"
+  OUT_DIR: devsecops-out
+
+jobs:
+  semgrep:
+    name: "SAST: Semgrep"
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Semgrep scan (official container)
+        id: scan
+        continue-on-error: true
+        env:
+          SEMGREP_CONFIG: ${{ inputs.semgrep-config }}
+        run: |
+          mkdir -p "$OUT_DIR" && chmod 0777 "$OUT_DIR"
+          args=()
+          for c in $SEMGREP_CONFIG; do args+=(--config "$c"); done
+          docker run --rm -v "$GITHUB_WORKSPACE:/src" -w /src "$SEMGREP_IMAGE" \
+            semgrep scan "${args[@]}" --metrics=off --sarif \
+            --output "$OUT_DIR/semgrep.sarif"
+
+      - name: Upload SARIF (code scanning)
+        if: always() && hashFiles('devsecops-out/semgrep.sarif') != ''
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
+        with:
+          sarif_file: devsecops-out/semgrep.sarif
+          category: semgrep
+
+      - name: Record status
+        if: always()
+        run: |
+          mkdir -p "$OUT_DIR"
+          echo "${{ steps.scan.outcome }}" > "$OUT_DIR/status-semgrep.txt"
+
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        if: always()
+        with:
+          name: devsecops-semgrep
+          path: devsecops-out/
+          retention-days: 30
+          if-no-files-found: ignore
+
+  codeql:
+    name: "SAST: CodeQL (${{ matrix.language }})"
+    if: ${{ inputs.codeql-languages != '' && inputs.codeql-languages != '[]' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        language: ${{ fromJSON(inputs.codeql-languages) }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Initialize CodeQL
+        id: init
+        continue-on-error: true
+        uses: github/codeql-action/init@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: none
+          queries: security-extended
+
+      - name: Analyze (uploads to code scanning)
+        id: scan
+        if: steps.init.outcome == 'success'
+        continue-on-error: true
+        uses: github/codeql-action/analyze@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
+        with:
+          category: "/language:${{ matrix.language }}"
+          output: codeql-sarif
+
+      - name: Record status
+        if: always()
+        env:
+          LANG_ID: ${{ matrix.language }}
+          OUTCOME: ${{ steps.init.outcome != 'success' && 'failure' || steps.scan.outcome }}
+        run: |
+          mkdir -p "$OUT_DIR"
+          for f in codeql-sarif/*.sarif; do
+            [ -f "$f" ] && cp "$f" "$OUT_DIR/codeql-${LANG_ID}.sarif"
+          done
+          echo "$OUTCOME" > "$OUT_DIR/status-codeql-${LANG_ID}.txt"
+
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        if: always()
+        with:
+          name: devsecops-codeql-${{ matrix.language }}
+          path: devsecops-out/
+          retention-days: 30
+          if-no-files-found: ignore
+
+  dependency-review:
+    name: "SCA: Dependency Review (PR)"
+    if: ${{ github.event_name == 'pull_request' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Dependency review (warn only)
+        id: scan
+        continue-on-error: true
+        uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+        with:
+          fail-on-severity: high
+          warn-only: true
+          comment-summary-in-pr: never
+
+      - name: Record status
+        if: always()
+        env:
+          VULN_CHANGES: ${{ steps.scan.outputs.vulnerable-changes }}
+        run: |
+          mkdir -p "$OUT_DIR"
+          printf '%s' "${VULN_CHANGES:-[]}" > "$OUT_DIR/dependency-review.json"
+          echo "${{ steps.scan.outcome }}" > "$OUT_DIR/status-dependency-review.txt"
+
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        if: always()
+        with:
+          name: devsecops-dependency-review
+          path: devsecops-out/
+          retention-days: 30
+          if-no-files-found: ignore
+
+  sca:
+    name: "SCA: Trivy fs + pip-audit"
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Install Trivy (pinned + checksum)
+        run: |
+          curl -sSfL -o trivy.tgz \
+            "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          echo "${TRIVY_SHA256}  trivy.tgz" | sha256sum -c -
+          tar -xzf trivy.tgz trivy && sudo mv trivy /usr/local/bin/ && rm trivy.tgz
+          trivy --version
+
+      - name: Trivy fs (vulnerable dependencies)
+        id: scan
+        continue-on-error: true
+        env:
+          SEVERITY: ${{ inputs.severity }}
+        run: |
+          mkdir -p "$OUT_DIR"
+          trivy fs --scanners vuln --format json --output "$OUT_DIR/trivy-sca.json" .
+          trivy fs --scanners vuln --severity "$SEVERITY" --format sarif \
+            --output "$OUT_DIR/trivy-sca.sarif" .
+          trivy fs --scanners vuln --severity CRITICAL,HIGH --format table .
+
+      - name: Upload SARIF (code scanning)
+        if: always() && hashFiles('devsecops-out/trivy-sca.sarif') != ''
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
+        with:
+          sarif_file: devsecops-out/trivy-sca.sarif
+          category: trivy-sca
+
+      - name: Set up Python (pip-audit)
+        if: ${{ inputs.python-requirements != '' }}
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+
+      - name: pip-audit (resolve ranges, then audit every pinned package)
+        id: pipaudit
+        if: ${{ inputs.python-requirements != '' }}
+        continue-on-error: true
+        env:
+          REQS: ${{ inputs.python-requirements }}
+        run: |
+          mkdir -p "$OUT_DIR"
+          python -m pip install --disable-pip-version-check --quiet "pip-audit==${PIP_AUDIT_VERSION}"
+          # requirements.txt uses >= ranges (no lockfile): resolve the exact set
+          # pip would install today (metadata only) and audit that pinned set.
+          python -m pip install --disable-pip-version-check --quiet --dry-run \
+            --ignore-installed --report /tmp/resolve.json -r "$REQS"
+          python - <<'PY'
+          import json, os
+          report = json.load(open("/tmp/resolve.json"))
+          out = os.path.join(os.environ["OUT_DIR"], "requirements.resolved.txt")
+          with open(out, "w") as fh:
+              for item in report.get("install", []):
+                  meta = item["metadata"]
+                  fh.write(f"{meta['name']}=={meta['version']}\n")
+          PY
+          pip-audit -r "$OUT_DIR/requirements.resolved.txt" --no-deps --disable-pip \
+            --progress-spinner off --format json --output "$OUT_DIR/pip-audit.json" || true
+          pip-audit -r "$OUT_DIR/requirements.resolved.txt" --no-deps --disable-pip \
+            --progress-spinner off --format markdown || true
+
+      - name: Record status
+        if: always()
+        env:
+          REQS: ${{ inputs.python-requirements }}
+        run: |
+          mkdir -p "$OUT_DIR"
+          echo "${{ steps.scan.outcome }}" > "$OUT_DIR/status-trivy-sca.txt"
+          if [ -n "$REQS" ]; then
+            echo "${{ steps.pipaudit.outcome }}" > "$OUT_DIR/status-pip-audit.txt"
+          fi
+
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        if: always()
+        with:
+          name: devsecops-sca
+          path: devsecops-out/
+          retention-days: 30
+          if-no-files-found: ignore
+
+  secrets:
+    name: "Secrets: Gitleaks (full history)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          # '0' must be a string: the number 0 is falsy and `x && 0 || 1` always yields 1.
+          fetch-depth: ${{ inputs.scan-history && '0' || '1' }}
+          persist-credentials: false
+
+      - name: Install Gitleaks (pinned + checksum)
+        run: |
+          curl -sSfL -o gitleaks.tgz \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "${GITLEAKS_SHA256}  gitleaks.tgz" | sha256sum -c -
+          tar -xzf gitleaks.tgz gitleaks && sudo mv gitleaks /usr/local/bin/ && rm gitleaks.tgz
+          gitleaks version
+
+      - name: Gitleaks scan (redacted)
+        id: scan
+        continue-on-error: true
+        env:
+          SCAN_HISTORY: ${{ inputs.scan-history }}
+        run: |
+          mkdir -p "$OUT_DIR"
+          cfg=()
+          [ -f .gitleaks.toml ] && cfg=(--config .gitleaks.toml)
+          if [ "$SCAN_HISTORY" = "true" ]; then
+            mode=(git .)
+          else
+            mode=(dir .)
+          fi
+          gitleaks "${mode[@]}" "${cfg[@]}" --no-banner --redact --exit-code 0 \
+            --report-format sarif --report-path "$OUT_DIR/gitleaks.sarif"
+          echo "commits scanned: $(git rev-list --count HEAD)"
+
+      - name: Upload SARIF (code scanning)
+        if: always() && hashFiles('devsecops-out/gitleaks.sarif') != ''
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
+        with:
+          sarif_file: devsecops-out/gitleaks.sarif
+          category: gitleaks
+
+      - name: Record status
+        if: always()
+        run: |
+          mkdir -p "$OUT_DIR"
+          echo "${{ steps.scan.outcome }}" > "$OUT_DIR/status-gitleaks.txt"
+
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        if: always()
+        with:
+          name: devsecops-secrets
+          path: devsecops-out/
+          retention-days: 30
+          if-no-files-found: ignore
+
+  iac:
+    name: "IaC: Trivy config + Fly.io policy"
+    if: ${{ inputs.run-iac-scan }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Install Trivy (pinned + checksum)
+        run: |
+          curl -sSfL -o trivy.tgz \
+            "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          echo "${TRIVY_SHA256}  trivy.tgz" | sha256sum -c -
+          tar -xzf trivy.tgz trivy && sudo mv trivy /usr/local/bin/ && rm trivy.tgz
+          trivy --version
+
+      - name: Trivy config (misconfigurations)
+        id: scan
+        continue-on-error: true
+        env:
+          SEVERITY: ${{ inputs.severity }}
+        run: |
+          mkdir -p "$OUT_DIR"
+          trivy config --format json --output "$OUT_DIR/trivy-iac.json" .
+          trivy config --severity "$SEVERITY" --format sarif --output "$OUT_DIR/trivy-iac.sarif" .
+          trivy config --format table .
+
+      - name: Fly.io policy check (fly.toml)
+        id: fly
+        continue-on-error: true
+        run: |
+          mkdir -p "$OUT_DIR"
+          python3 - <<'PY'
+          # Minimal policy-as-code for Fly.io manifests (no public scanner covers fly.toml):
+          #   FLY001 http_service.force_https must be true (TLS only at the edge)
+          #   FLY002 [env] must not carry secret-looking keys (use `fly secrets set`)
+          import glob, json, os, re, tomllib
+          rules = {
+              "FLY001": ("fly.toml must force HTTPS (http_service.force_https = true)", "error", "8.0"),
+              "FLY002": ("fly.toml [env] contains a secret-looking key; use fly secrets instead", "error", "9.0"),
+          }
+          results = []
+          files = [f for f in glob.glob("**/fly.toml", recursive=True) if "node_modules" not in f]
+          for path in files:
+              with open(path, "rb") as fh:
+                  cfg = tomllib.load(fh)
+              services = []
+              if isinstance(cfg.get("http_service"), dict):
+                  services.append(cfg["http_service"])
+              for svc in cfg.get("services", []) or []:
+                  for port in svc.get("ports", []) or []:
+                      if "http" in (port.get("handlers") or []):
+                          services.append({"force_https": port.get("force_https", False)})
+              if services and not all(s.get("force_https") is True for s in services):
+                  results.append(("FLY001", path, "force_https is not true"))
+              for key in (cfg.get("env") or {}):
+                  if re.search(r"(SECRET|PASSWORD|TOKEN|PRIVATE|API_KEY)", key, re.I):
+                      results.append(("FLY002", path, f"[env] key {key}"))
+          sarif = {
+              "version": "2.1.0",
+              "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+              "runs": [{
+                  "tool": {"driver": {
+                      "name": "fly-policy",
+                      "informationUri": "https://fly.io/docs/reference/configuration/",
+                      "rules": [{
+                          "id": rid,
+                          "shortDescription": {"text": text},
+                          "defaultConfiguration": {"level": level},
+                          "properties": {"security-severity": sev, "tags": ["security", "iac"]},
+                      } for rid, (text, level, sev) in rules.items()],
+                  }},
+                  "results": [{
+                      "ruleId": rid,
+                      "level": rules[rid][1],
+                      "message": {"text": f"{rules[rid][0]} ({detail})"},
+                      "locations": [{"physicalLocation": {
+                          "artifactLocation": {"uri": path},
+                          "region": {"startLine": 1},
+                      }}],
+                  } for rid, path, detail in results],
+              }],
+          }
+          out = os.path.join(os.environ["OUT_DIR"], "fly-policy.sarif")
+          with open(out, "w") as fh:
+              json.dump(sarif, fh, indent=2)
+          print(f"fly.toml files: {files or 'none'}; findings: {len(results)}")
+          for rid, path, detail in results:
+              print(f"  {rid} {path}: {detail}")
+          PY
+
+      - name: "Upload SARIF (Trivy config)"
+        if: always() && hashFiles('devsecops-out/trivy-iac.sarif') != ''
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
+        with:
+          sarif_file: devsecops-out/trivy-iac.sarif
+          category: trivy-iac
+
+      - name: "Upload SARIF (Fly.io policy)"
+        if: always() && hashFiles('devsecops-out/fly-policy.sarif') != ''
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
+        with:
+          sarif_file: devsecops-out/fly-policy.sarif
+          category: fly-policy
+
+      - name: Record status
+        if: always()
+        run: |
+          mkdir -p "$OUT_DIR"
+          echo "${{ steps.scan.outcome }}" > "$OUT_DIR/status-trivy-iac.txt"
+          echo "${{ steps.fly.outcome }}" > "$OUT_DIR/status-fly-policy.txt"
+
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        if: always()
+        with:
+          name: devsecops-iac
+          path: devsecops-out/
+          retention-days: 30
+          if-no-files-found: ignore
+
+  container:
+    name: "Container: Trivy image"
+    if: ${{ inputs.run-container-scan && inputs.dockerfile != '' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Install Trivy (pinned + checksum)
+        run: |
+          curl -sSfL -o trivy.tgz \
+            "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          echo "${TRIVY_SHA256}  trivy.tgz" | sha256sum -c -
+          tar -xzf trivy.tgz trivy && sudo mv trivy /usr/local/bin/ && rm trivy.tgz
+          trivy --version
+
+      - name: Build image locally (never pushed)
+        id: build
+        continue-on-error: true
+        env:
+          DOCKERFILE: ${{ inputs.dockerfile }}
+          CONTEXT: ${{ inputs.docker-context }}
+        run: |
+          docker build --pull -t "devsecops-scan:${GITHUB_SHA}" -f "$DOCKERFILE" "$CONTEXT"
+          docker image inspect "devsecops-scan:${GITHUB_SHA}" \
+            --format 'user={{.Config.User}} size={{.Size}}'
+
+      - name: Trivy image scan
+        id: scan
+        if: steps.build.outcome == 'success'
+        continue-on-error: true
+        env:
+          SEVERITY: ${{ inputs.severity }}
+        run: |
+          mkdir -p "$OUT_DIR"
+          img="devsecops-scan:${GITHUB_SHA}"
+          trivy image --scanners vuln,secret --format json --output "$OUT_DIR/trivy-image.json" "$img"
+          trivy image --scanners vuln,secret --severity "$SEVERITY" --format sarif \
+            --output "$OUT_DIR/trivy-image.sarif" "$img"
+          trivy image --format cyclonedx --output "$OUT_DIR/sbom-image.cdx.json" "$img"
+          trivy image --scanners vuln --severity CRITICAL,HIGH --format table "$img"
+
+      - name: Upload SARIF (code scanning)
+        if: always() && hashFiles('devsecops-out/trivy-image.sarif') != ''
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
+        with:
+          sarif_file: devsecops-out/trivy-image.sarif
+          category: trivy-image
+
+      - name: Record status
+        if: always()
+        run: |
+          mkdir -p "$OUT_DIR"
+          if [ "${{ steps.build.outcome }}" != "success" ]; then
+            echo "failure" > "$OUT_DIR/status-trivy-image.txt"
+          else
+            echo "${{ steps.scan.outcome }}" > "$OUT_DIR/status-trivy-image.txt"
+          fi
+
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        if: always()
+        with:
+          name: devsecops-container
+          path: devsecops-out/
+          retention-days: 30
+          if-no-files-found: ignore
+
+  sbom:
+    name: "SBOM: CycloneDX (source)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Install Trivy (pinned + checksum)
+        run: |
+          curl -sSfL -o trivy.tgz \
+            "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          echo "${TRIVY_SHA256}  trivy.tgz" | sha256sum -c -
+          tar -xzf trivy.tgz trivy && sudo mv trivy /usr/local/bin/ && rm trivy.tgz
+          trivy --version
+
+      - name: Generate CycloneDX SBOM
+        id: scan
+        continue-on-error: true
+        run: |
+          mkdir -p "$OUT_DIR"
+          trivy fs --format cyclonedx --output "$OUT_DIR/sbom-source.cdx.json" .
+          python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print('components:', len(d.get('components', [])))" \
+            "$OUT_DIR/sbom-source.cdx.json"
+
+      - name: Record status
+        if: always()
+        run: |
+          mkdir -p "$OUT_DIR"
+          echo "${{ steps.scan.outcome }}" > "$OUT_DIR/status-sbom.txt"
+
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        if: always()
+        with:
+          name: devsecops-sbom
+          path: devsecops-out/
+          retention-days: 90
+          if-no-files-found: ignore
+
+  summary:
+    name: "Summary: findings by tool"
+    needs: [semgrep, codeql, dependency-review, sca, secrets, iac, container, sbom]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    continue-on-error: true
+    steps:
+      - name: Download scan results
+        continue-on-error: true
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          pattern: devsecops-*
+          path: results
+          merge-multiple: true
+
+      - name: Build findings table
+        env:
+          REPO: ${{ github.repository }}
+          REF: ${{ github.ref_name }}
+          EVENT: ${{ github.event_name }}
+          SHA: ${{ github.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          mkdir -p results report
+          python3 - <<'PY'
+          import glob, json, os
+
+          SEVS = ["critical", "high", "medium", "low"]
+          LEVEL_MAP = {"error": "high", "warning": "medium", "note": "low", "none": "low"}
+          # (file prefix, stage, tool label, status file)
+          TOOLS = [
+              ("semgrep", "SAST", "Semgrep CE", "semgrep"),
+              ("codeql-", "SAST", "CodeQL", None),
+              ("trivy-sca", "SCA", "Trivy fs (deps)", "trivy-sca"),
+              ("gitleaks", "Secrets", "Gitleaks (history)", "gitleaks"),
+              ("trivy-iac", "IaC", "Trivy config", "trivy-iac"),
+              ("fly-policy", "IaC", "Fly.io policy", "fly-policy"),
+              ("trivy-image", "Container", "Trivy image", "trivy-image"),
+          ]
+
+          def status(name):
+              path = os.path.join("results", f"status-{name}.txt")
+              if not os.path.exists(path):
+                  return None
+              value = open(path).read().strip() or "unknown"
+              return {"success": "ok", "failure": "falhou", "skipped": "pulado"}.get(value, value)
+
+          def severity(result, rules, tool):
+              if tool == "gitleaks":
+                  return "high"
+              rule = rules.get(result.get("ruleId"), {})
+              props = rule.get("properties") or {}
+              score = props.get("security-severity") or (result.get("properties") or {}).get("security-severity")
+              if score is not None:
+                  try:
+                      v = float(score)
+                      return "critical" if v >= 9 else "high" if v >= 7 else "medium" if v >= 4 else "low"
+                  except ValueError:
+                      pass
+              level = result.get("level") or (rule.get("defaultConfiguration") or {}).get("level") or "warning"
+              return LEVEL_MAP.get(level, "medium")
+
+          def count_trivy_json(path):
+              counts = dict.fromkeys(SEVS, 0)
+              data = json.load(open(path))
+              for res in data.get("Results", []) or []:
+                  items = (res.get("Vulnerabilities") or []) + (res.get("Secrets") or []) + [
+                      m for m in (res.get("Misconfigurations") or []) if m.get("Status") == "FAIL"]
+                  for item in items:
+                      sev = (item.get("Severity") or "LOW").lower()
+                      counts[sev if sev in counts else "low"] += 1
+              return counts
+
+          def count_sarif(path, tool):
+              counts = dict.fromkeys(SEVS, 0)
+              data = json.load(open(path))
+              for run in data.get("runs", []):
+                  driver = run.get("tool", {}).get("driver", {})
+                  rules = {r.get("id"): r for r in driver.get("rules", []) or []}
+                  for ext in run.get("tool", {}).get("extensions", []) or []:
+                      rules.update({r.get("id"): r for r in ext.get("rules", []) or []})
+                  for res in run.get("results", []) or []:
+                      counts[severity(res, rules, tool)] += 1
+              return counts
+
+          rows = []
+          for prefix, stage, label, status_name in TOOLS:
+              files = sorted(glob.glob(os.path.join("results", f"{prefix}*.sarif")))
+              if prefix == "codeql-":
+                  langs = sorted({os.path.basename(p)[len("status-codeql-"):-4]
+                                  for p in glob.glob("results/status-codeql-*.txt")})
+                  for lang in langs:
+                      f = os.path.join("results", f"codeql-{lang}.sarif")
+                      counts = count_sarif(f, "codeql") if os.path.exists(f) else None
+                      rows.append((stage, f"CodeQL ({lang})", status(f"codeql-{lang}"), counts))
+                  continue
+              st = status(status_name)
+              trivy_json = os.path.join("results", f"{prefix}.json")
+              if prefix.startswith("trivy") and os.path.exists(trivy_json):
+                  # Trivy JSON carries every severity (the SARIF export is filtered).
+                  rows.append((stage, label, st, count_trivy_json(trivy_json)))
+                  continue
+              if not files and st is None:
+                  continue
+              counts = dict.fromkeys(SEVS, 0) if files else None
+              for f in files:
+                  c = count_sarif(f, prefix)
+                  for k in SEVS:
+                      counts[k] += c[k]
+              rows.append((stage, label, st, counts))
+
+          extra = []
+          pa = os.path.join("results", "pip-audit.json")
+          if os.path.exists(pa):
+              data = json.load(open(pa))
+              deps = data.get("dependencies", data if isinstance(data, list) else [])
+              vulns = sum(len(d.get("vulns", [])) for d in deps)
+              extra.append(("SCA", "pip-audit (Python)", status("pip-audit"), f"{vulns} vulnerabilidades em {len(deps)} pacotes resolvidos"))
+          dr = os.path.join("results", "dependency-review.json")
+          if os.path.exists(dr):
+              try:
+                  changes = json.load(open(dr)) or []
+              except ValueError:
+                  changes = []
+              n = sum(len(c.get("vulnerabilities", [])) for c in changes)
+              extra.append(("SCA", "Dependency Review (PR)", status("dependency-review"), f"{n} vulnerabilidades introduzidas pelo PR"))
+          for sbom in sorted(glob.glob("results/sbom-*.cdx.json")):
+              comps = len(json.load(open(sbom)).get("components", []))
+              kind = "imagem" if "image" in sbom else "codigo-fonte"
+              st = status("sbom") if kind == "codigo-fonte" else status("trivy-image")
+              extra.append(("SBOM", f"CycloneDX ({kind})", st, f"{comps} componentes inventariados"))
+
+          env = os.environ
+          lines = [
+              f"## DevSecOps: resumo de achados ({env['REPO']})",
+              "",
+              f"Evento `{env['EVENT']}` em `{env['REF']}` (commit `{env['SHA'][:7]}`). "
+              "Pipeline report-only: nenhum achado bloqueia o merge; detalhes na aba Security > Code scanning.",
+              "",
+              "| Estagio | Ferramenta | Execucao | Critical | High | Medium | Low | Total |",
+              "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: |",
+          ]
+          totals = dict.fromkeys(SEVS, 0)
+          summary = {"repository": env["REPO"], "ref": env["REF"], "event": env["EVENT"],
+                     "sha": env["SHA"], "run_url": env["RUN_URL"], "tools": []}
+          for stage, label, st, counts in rows:
+              if counts is None:
+                  lines.append(f"| {stage} | {label} | {st or 'n/a'} | - | - | - | - | - |")
+                  summary["tools"].append({"stage": stage, "tool": label, "status": st, "counts": None})
+                  continue
+              total = sum(counts.values())
+              for k in SEVS:
+                  totals[k] += counts[k]
+              lines.append(f"| {stage} | {label} | {st or 'n/a'} | {counts['critical']} | {counts['high']} | "
+                           f"{counts['medium']} | {counts['low']} | {total} |")
+              summary["tools"].append({"stage": stage, "tool": label, "status": st, "counts": counts, "total": total})
+          lines.append(f"| **Total** | | | **{totals['critical']}** | **{totals['high']}** | "
+                       f"**{totals['medium']}** | **{totals['low']}** | **{sum(totals.values())}** |")
+          if extra:
+              lines += ["", "| Estagio | Ferramenta | Execucao | Resultado |", "| --- | --- | --- | --- |"]
+              for stage, label, st, text in extra:
+                  lines.append(f"| {stage} | {label} | {st or 'n/a'} | {text} |")
+                  summary["tools"].append({"stage": stage, "tool": label, "status": st, "result": text})
+          lines += ["", "Severidade: `security-severity` (CVSS) quando o SARIF traz; senao o nivel "
+                    "SARIF (error=High, warning=Medium, note=Low). Segredos contam como High."]
+          summary["totals"] = totals
+          md = "\n".join(lines) + "\n"
+          open("report/devsecops-summary.md", "w").write(md)
+          json.dump(summary, open("report/devsecops-summary.json", "w"), indent=2)
+          with open(env["GITHUB_STEP_SUMMARY"], "a") as fh:
+              fh.write(md)
+          print(md)
+          PY
+
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        if: always()
+        with:
+          name: devsecops-report
+          path: report/
+          retention-days: 90
+          if-no-files-found: ignore

@@ -1,0 +1,38 @@
+name: DevSecOps self-test
+
+# Runs the reusable DevSecOps pipeline against this repository (the org CI
+# definitions themselves), so every change to devsecops.yml is exercised
+# before callers pick it up through @main.
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/devsecops.yml"
+      - ".github/workflows/devsecops-selftest.yml"
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/devsecops.yml"
+      - ".github/workflows/devsecops-selftest.yml"
+  schedule:
+    - cron: "41 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  security-events: write
+  pull-requests: read
+
+concurrency:
+  group: devsecops-selftest-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  devsecops:
+    name: DevSecOps
+    uses: ./.github/workflows/devsecops.yml
+    with:
+      codeql-languages: '["actions"]'
+      semgrep-config: "p/default p/github-actions"
+      run-container-scan: false
