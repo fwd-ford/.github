@@ -13,8 +13,23 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: aquasecurity/trivy-action@master
+      # Trivy resolves pom.xml by reading POMs from ~/.m2 first and only then from Maven
+      # Central. Without a warm local repository it downloads every BOM remotely and
+      # GitHub-hosted runners get "remote Maven repository returned 429 Too Many Requests"
+      # (FATAL), so the gate failed on rate limiting instead of on vulnerabilities.
+      - uses: actions/setup-java@v4
         with:
+          distribution: temurin
+          java-version: ${{ inputs.java-version }}
+          cache: maven
+      - name: Resolve Maven dependencies into ~/.m2
+        run: |
+          chmod +x mvnw
+          ./mvnw -B -q -ntp dependency:go-offline
+      # Pinned by commit SHA: trivy-action tags were hijacked in March 2026, never use @master.
+      - uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          version: v0.74.0
           scan-type: fs
           scan-ref: .
           severity: CRITICAL,HIGH
