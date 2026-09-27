@@ -130,7 +130,7 @@ jobs:
           mkdir -p "$OUT_DIR"
           echo "${{ steps.scan.outcome }}" > "$OUT_DIR/status-semgrep.txt"
 
-      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
           name: devsecops-semgrep
@@ -183,7 +183,7 @@ jobs:
           done
           echo "$OUTCOME" > "$OUT_DIR/status-codeql-${LANG_ID}.txt"
 
-      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
           name: devsecops-codeql-${{ matrix.language }}
@@ -220,7 +220,7 @@ jobs:
           printf '%s' "${VULN_CHANGES:-[]}" > "$OUT_DIR/dependency-review.json"
           echo "${{ steps.scan.outcome }}" > "$OUT_DIR/status-dependency-review.txt"
 
-      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
           name: devsecops-dependency-review
@@ -328,7 +328,7 @@ jobs:
             echo "${{ steps.pipaudit.outcome }}" > "$OUT_DIR/status-pip-audit.txt"
           fi
 
-      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
           name: devsecops-sca
@@ -388,7 +388,7 @@ jobs:
           mkdir -p "$OUT_DIR"
           echo "${{ steps.scan.outcome }}" > "$OUT_DIR/status-gitleaks.txt"
 
-      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
           name: devsecops-secrets
@@ -581,7 +581,7 @@ jobs:
           echo "${{ steps.scan.outcome }}" > "$OUT_DIR/status-trivy-iac.txt"
           echo "${{ steps.paas.outcome }}" > "$OUT_DIR/status-paas-policy.txt"
 
-      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
           name: devsecops-iac
@@ -652,7 +652,7 @@ jobs:
             echo "${{ steps.scan.outcome }}" > "$OUT_DIR/status-trivy-image.txt"
           fi
 
-      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
           name: devsecops-container
@@ -742,7 +742,7 @@ jobs:
           mkdir -p "$OUT_DIR"
           echo "${{ steps.scan.outcome }}" > "$OUT_DIR/status-sbom.txt"
 
-      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
           name: devsecops-sbom
@@ -935,7 +935,7 @@ jobs:
           print(md)
           PY
 
-      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
           name: devsecops-report

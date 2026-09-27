@@ -48,7 +48,7 @@ jobs:
       - run: ./mvnw -B test ${{ inputs.maven-args }}
       - name: Upload Surefire reports
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: surefire-reports
           path: target/surefire-reports/
