@@ -21,6 +21,7 @@
 | Lucca Borges | 554608 | ML / Data | [@lucksza](https://github.com/lucksza) |
 | Ruan Melo | 557599 | Backend / SOA | [@DevRuanVieira](https://github.com/DevRuanVieira) |
 | Rodrigo Jimenez (Roji) | 558148 | QA / Produto | — |
+| Bruno Leão | 555563 | Desenvolvimento | — |
 
 ## Visão geral
 
