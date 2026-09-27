@@ -17,7 +17,7 @@ jobs:
       # Central. Without a warm local repository it downloads every BOM remotely and
       # GitHub-hosted runners get "remote Maven repository returned 429 Too Many Requests"
       # (FATAL), so the gate failed on rate limiting instead of on vulnerabilities.
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: ${{ inputs.java-version }}
@@ -46,7 +46,7 @@ jobs:
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: ${{ inputs.java-version }}
