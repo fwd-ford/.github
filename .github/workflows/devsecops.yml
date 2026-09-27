@@ -7,7 +7,8 @@ name: DevSecOps (reusable)
 #   2. SCA        dependency-review (PRs only) + Trivy fs (lockfiles/manifests)
 #                 + pip-audit for Python requirements (resolved before audit)
 #   3. Secrets    Gitleaks over the full git history
-#   4. IaC        Trivy config (Dockerfile/K8s/Terraform) + Fly.io policy check
+#   4. IaC        Trivy config (Dockerfile/K8s/Terraform) + PaaS manifest policy
+#                 (render.yaml; fly.toml kept for legacy manifests)
 #   5. Container  build the Dockerfile locally and scan the image with Trivy
 #   6. SBOM       CycloneDX (source tree, plus the image when it is built)
 #   7. Summary    findings per tool and severity in $GITHUB_STEP_SUMMARY
@@ -57,7 +58,7 @@ on:
         type: boolean
         default: false
       run-iac-scan:
-        description: "Run Trivy config and the Fly.io policy check."
+        description: "Run Trivy config and the PaaS manifest policy (render.yaml, fly.toml)."
         type: boolean
         default: true
       python-requirements:
@@ -396,7 +397,7 @@ jobs:
           if-no-files-found: ignore
 
   iac:
-    name: "IaC: Trivy config + Fly.io policy"
+    name: "IaC: Trivy config + PaaS policy"
     if: ${{ inputs.run-iac-scan }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -425,23 +426,91 @@ jobs:
           trivy config --severity "$SEVERITY" --format sarif --output "$OUT_DIR/trivy-iac.sarif" .
           trivy config --format table .
 
-      - name: Fly.io policy check (fly.toml)
-        id: fly
+      - name: PaaS manifest policy (render.yaml, fly.toml)
+        id: paas
         continue-on-error: true
         run: |
           mkdir -p "$OUT_DIR"
           python3 - <<'PY'
-          # Minimal policy-as-code for Fly.io manifests (no public scanner covers fly.toml):
-          #   FLY001 http_service.force_https must be true (TLS only at the edge)
-          #   FLY002 [env] must not carry secret-looking keys (use `fly secrets set`)
-          import glob, json, os, re, tomllib
-          rules = {
+          # Minimal policy-as-code for PaaS deployment manifests (no public scanner covers them):
+          #   RND001 render.yaml: secret-looking env var with a literal value (use generateValue or sync: false)
+          #   RND002 render.yaml: web service without healthCheckPath
+          #   RND003 render.yaml: datastore reachable from any IP (ipAllowList missing or 0.0.0.0/0)
+          #   RND004 render.yaml: credentials embedded in a URL value
+          #   FLY001 fly.toml:    http_service.force_https must be true (legacy Fly.io manifests)
+          #   FLY002 fly.toml:    [env] carries a secret-looking key (use fly secrets instead)
+          import glob, json, os, re, subprocess, tomllib
+
+          RULES = {
+              "RND001": ("render.yaml env var with a secret-looking key has a literal value; use generateValue: true or sync: false", "error", "9.0"),
+              "RND002": ("render.yaml web service has no healthCheckPath", "warning", "4.0"),
+              "RND003": ("render.yaml datastore accepts connections from any IP (set ipAllowList)", "error", "7.5"),
+              "RND004": ("render.yaml env var embeds credentials in a URL", "error", "9.0"),
               "FLY001": ("fly.toml must force HTTPS (http_service.force_https = true)", "error", "8.0"),
               "FLY002": ("fly.toml [env] contains a secret-looking key; use fly secrets instead", "error", "9.0"),
           }
+          SECRET_KEY = re.compile(r"(SECRET|PASSWORD|PASSWD|TOKEN|PRIVATE|API_?KEY|CREDENTIAL)", re.I)
+          URL_CREDS = re.compile(r"[a-z][a-z0-9+.-]*://[^/\s:@]+:[^/\s@]+@", re.I)
+          OPEN = ("0.0.0.0/0", "::/0")
           results = []
-          files = [f for f in glob.glob("**/fly.toml", recursive=True) if "node_modules" not in f]
-          for path in files:
+
+          def manifests(*patterns):
+              found = set()
+              for pattern in patterns:
+                  found.update(f for f in glob.glob(pattern, recursive=True) if "node_modules" not in f)
+              return sorted(found)
+
+          def load_yaml(path):
+              try:
+                  import yaml
+                  with open(path, encoding="utf-8") as fh:
+                      return yaml.safe_load(fh) or {}
+              except ImportError:
+                  out = subprocess.run(["yq", "-o=json", ".", path], check=True,
+                                       capture_output=True, text=True).stdout
+                  return json.loads(out or "{}")
+
+          def line_of(path, needle):
+              with open(path, encoding="utf-8") as fh:
+                  for number, line in enumerate(fh, 1):
+                      if needle and needle in line:
+                          return number
+              return 1
+
+          def check_env(path, env_vars, owner):
+              for ev in env_vars or []:
+                  if not isinstance(ev, dict) or ev.get("value") is None:
+                      continue
+                  key, value = str(ev.get("key", "")), str(ev["value"])
+                  if SECRET_KEY.search(key):
+                      results.append(("RND001", path, line_of(path, key), f"{owner}: {key}"))
+                  elif URL_CREDS.search(value):
+                      results.append(("RND004", path, line_of(path, key), f"{owner}: {key}"))
+
+          def open_to_world(allow):
+              if allow is None:
+                  return True
+              return any(isinstance(e, dict) and str(e.get("source", "")) in OPEN for e in allow)
+
+          render_files = manifests("**/render.yaml", "**/render.yml")
+          for path in render_files:
+              doc = load_yaml(path)
+              for svc in doc.get("services", []) or []:
+                  name = str(svc.get("name", "?"))
+                  check_env(path, svc.get("envVars"), f"service {name}")
+                  if svc.get("type") == "web" and not svc.get("healthCheckPath"):
+                      results.append(("RND002", path, line_of(path, name), f"service {name}"))
+                  if svc.get("type") in ("keyvalue", "redis") and open_to_world(svc.get("ipAllowList")):
+                      results.append(("RND003", path, line_of(path, name), f"service {name}"))
+              for group in doc.get("envVarGroups", []) or []:
+                  check_env(path, group.get("envVars"), f"envVarGroup {group.get('name', '?')}")
+              for db in doc.get("databases", []) or []:
+                  if open_to_world(db.get("ipAllowList")):
+                      name = str(db.get("name", "?"))
+                      results.append(("RND003", path, line_of(path, name), f"database {name}"))
+
+          fly_files = manifests("**/fly.toml")
+          for path in fly_files:
               with open(path, "rb") as fh:
                   cfg = tomllib.load(fh)
               services = []
@@ -452,41 +521,41 @@ jobs:
                       if "http" in (port.get("handlers") or []):
                           services.append({"force_https": port.get("force_https", False)})
               if services and not all(s.get("force_https") is True for s in services):
-                  results.append(("FLY001", path, "force_https is not true"))
+                  results.append(("FLY001", path, line_of(path, "force_https"), "force_https is not true"))
               for key in (cfg.get("env") or {}):
-                  if re.search(r"(SECRET|PASSWORD|TOKEN|PRIVATE|API_KEY)", key, re.I):
-                      results.append(("FLY002", path, f"[env] key {key}"))
+                  if SECRET_KEY.search(key):
+                      results.append(("FLY002", path, line_of(path, key), f"[env] key {key}"))
+
           sarif = {
               "version": "2.1.0",
               "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
               "runs": [{
                   "tool": {"driver": {
-                      "name": "fly-policy",
-                      "informationUri": "https://fly.io/docs/reference/configuration/",
+                      "name": "paas-policy",
+                      "informationUri": "https://render.com/docs/blueprint-spec",
                       "rules": [{
                           "id": rid,
                           "shortDescription": {"text": text},
                           "defaultConfiguration": {"level": level},
                           "properties": {"security-severity": sev, "tags": ["security", "iac"]},
-                      } for rid, (text, level, sev) in rules.items()],
+                      } for rid, (text, level, sev) in RULES.items()],
                   }},
                   "results": [{
                       "ruleId": rid,
-                      "level": rules[rid][1],
-                      "message": {"text": f"{rules[rid][0]} ({detail})"},
+                      "level": RULES[rid][1],
+                      "message": {"text": f"{RULES[rid][0]} ({detail})"},
                       "locations": [{"physicalLocation": {
                           "artifactLocation": {"uri": path},
-                          "region": {"startLine": 1},
+                          "region": {"startLine": line},
                       }}],
-                  } for rid, path, detail in results],
+                  } for rid, path, line, detail in results],
               }],
           }
-          out = os.path.join(os.environ["OUT_DIR"], "fly-policy.sarif")
-          with open(out, "w") as fh:
+          with open(os.path.join(os.environ["OUT_DIR"], "paas-policy.sarif"), "w") as fh:
               json.dump(sarif, fh, indent=2)
-          print(f"fly.toml files: {files or 'none'}; findings: {len(results)}")
-          for rid, path, detail in results:
-              print(f"  {rid} {path}: {detail}")
+          print(f"render manifests: {render_files or 'none'}; fly manifests: {fly_files or 'none'}; findings: {len(results)}")
+          for rid, path, line, detail in results:
+              print(f"  {rid} {path}:{line} {detail}")
           PY
 
       - name: "Upload SARIF (Trivy config)"
@@ -497,20 +566,20 @@ jobs:
           sarif_file: devsecops-out/trivy-iac.sarif
           category: trivy-iac
 
-      - name: "Upload SARIF (Fly.io policy)"
-        if: always() && hashFiles('devsecops-out/fly-policy.sarif') != ''
+      - name: "Upload SARIF (PaaS policy)"
+        if: always() && hashFiles('devsecops-out/paas-policy.sarif') != ''
         continue-on-error: true
         uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
         with:
-          sarif_file: devsecops-out/fly-policy.sarif
-          category: fly-policy
+          sarif_file: devsecops-out/paas-policy.sarif
+          category: paas-policy
 
       - name: Record status
         if: always()
         run: |
           mkdir -p "$OUT_DIR"
           echo "${{ steps.scan.outcome }}" > "$OUT_DIR/status-trivy-iac.txt"
-          echo "${{ steps.fly.outcome }}" > "$OUT_DIR/status-fly-policy.txt"
+          echo "${{ steps.paas.outcome }}" > "$OUT_DIR/status-paas-policy.txt"
 
       - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         if: always()
@@ -718,7 +787,7 @@ jobs:
               ("trivy-sca", "SCA", "Trivy fs (deps)", "trivy-sca"),
               ("gitleaks", "Secrets", "Gitleaks (history)", "gitleaks"),
               ("trivy-iac", "IaC", "Trivy config", "trivy-iac"),
-              ("fly-policy", "IaC", "Fly.io policy", "fly-policy"),
+              ("paas-policy", "IaC", "PaaS policy (render.yaml/fly.toml)", "paas-policy"),
               ("trivy-image", "Container", "Trivy image", "trivy-image"),
           ]
 
